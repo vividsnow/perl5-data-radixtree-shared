@@ -1,5 +1,9 @@
 Revision history for Data-RadixTree-Shared
 
+0.03      2026-07-21
+          - Make the edge split crash-safe and recycle freed nodes.
+          - Fail insert on node-pool exhaustion instead of corrupting NIL.
+
 0.02      2026-07-03
           - Security and robustness hardening; backing files now created mode
             0600 (pass a file-mode argument to new() for cross-user sharing).
