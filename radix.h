@@ -610,16 +610,47 @@ static inline uint32_t rdx_arena_append(RdxHandle *h, const uint8_t *bytes, uint
     return off;
 }
 
-/* Worst case any single insert consumes: up to 2 new nodes (a split makes a
- * mid node + a leaf node) and up to klen arena bytes (the leaf's label).
- * v1 has no freelist, so the 2 nodes must come fresh from the high-water mark.
- * Returns 1 if both fit, 0 otherwise.  Caller holds the write lock. */
+/* Worst case any single insert consumes: the copy-on-write edge split
+ * transiently allocates THREE nodes (mid + ch2 + the new leaf) before the
+ * displaced child is recycled post-commit (net consumption is 2), plus up to
+ * klen arena bytes (the leaf's label).  Returns 1 if both fit, 0 otherwise.
+ * Caller holds the write lock. */
+#define RDX_INSERT_MAX_ALLOC 3
+
+/* Count the nodes a single insert can draw on: fresh high-water slots plus
+ * free-list entries.  rdx_alloc_node recycles before bumping the high-water
+ * mark, so both sources must count -- checking the high-water mark alone
+ * would refuse inserts that recycled nodes could satisfy, and (pre-fix)
+ * checking it against 2 instead of 3 let a split run out of nodes mid-way
+ * and return 0, which insert reported as "key already existed, updated"
+ * while the key was never stored.
+ * The free-list head and links live in peer-writable shared memory, threaded
+ * through label_off: walking at most the remaining need keeps a corrupt list
+ * containing a cycle bounded here, and every link is checked against the
+ * cached pool capacity before it is dereferenced -- the same bounds
+ * rdx_alloc_node applies when it pops.  The walk runs under the caller's
+ * write lock, so a well-formed list cannot change under it. */
+static inline int rdx_nodes_available(RdxHandle *h, uint32_t need) {
+    RdxHeader *hdr = h->hdr;
+    /* Cached cap: the used counter is peer-writable, so compute headroom
+     * against the fixed geometry (and clamp an inflated used-mark to "no
+     * high-water room", so the unsigned subtraction can never wrap to a huge
+     * "room available"). */
+    uint32_t avail = (hdr->node_used < h->node_cap) ? h->node_cap - hdr->node_used : 0;
+    RdxNode *nodes = rdx_nodes(h);
+    uint32_t idx = hdr->free_head;
+    while (avail < need && idx != 0 && idx < h->node_cap) {
+        avail++;
+        idx = nodes[idx].label_off;
+    }
+    return avail >= need;
+}
+
 static inline int rdx_insert_has_room(RdxHandle *h, uint32_t klen) {
     RdxHeader *hdr = h->hdr;
-    /* Cached caps: the used counters are peer-writable, so compute headroom
-     * against the fixed geometry (and guard the unsigned subtraction against an
-     * inflated used-mark that would otherwise wrap to a huge "room available"). */
-    if (hdr->node_used > h->node_cap || h->node_cap - hdr->node_used < 2) return 0;
+    if (!rdx_nodes_available(h, RDX_INSERT_MAX_ALLOC)) return 0;
+    /* Cached cap, same anti-wrap guard as above for the peer-writable
+     * arena_used. */
     if (hdr->arena_used > h->arena_cap || h->arena_cap - hdr->arena_used < klen) return 0;
     return 1;
 }
@@ -849,6 +880,11 @@ static inline void rdx_clear_locked(RdxHandle *h) {
     hdr->node_used = 2;
     hdr->arena_used = 0;
     hdr->keys = 0;
+    /* Drop the recycle list too. It names nodes above the reset high-water
+     * mark, so leaving it would hand the same node out twice -- once popped
+     * from the stale list and once from the bump path -- silently losing the
+     * keys stored under whichever insert lost the race. */
+    hdr->free_head = 0;
     if (hdr->root && hdr->root < h->node_cap)        /* root is peer-writable; keep the memset in-pool */
         memset(&nodes[hdr->root], 0, sizeof(RdxNode));   /* zero children + has_value + label */
 }

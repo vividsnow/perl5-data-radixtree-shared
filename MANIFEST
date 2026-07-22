@@ -15,6 +15,7 @@ xt/crash_recovery.t
 xt/destroy_during_call.t
 xt/eg_runs.t
 xt/fork_radix.t
+xt/insert_split_capacity.t
 xt/kwalitee.t
 xt/node_pool_exhaustion.t
 xt/pod.t
