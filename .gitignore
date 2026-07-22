@@ -10,3 +10,4 @@
 *.bs
 /ppport.h
 *.tar.gz
+/Data-RadixTree-Shared-*/
