@@ -1,6 +1,8 @@
 Revision history for Data-RadixTree-Shared
 
 0.03      2026-07-23
+          - On-disk format change (v1 -> v2): an existing 0.02 file is
+            refused; recreate it.
           - Reset the node recycle list in clear(): a stale free list handed the
             same node out twice after a clear, silently losing keys while
             count still counted them.
