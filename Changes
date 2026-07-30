@@ -1,6 +1,9 @@
 Revision history for Data-RadixTree-Shared
 
 0.03      2026-07-23
+          - Add a frozen read-only mode: freeze() seals a file-backed radix tree
+            immutable; new_readonly() opens it O_RDONLY / PROT_READ and queries
+            it lock-free.
           - On-disk format change (v1 -> v2): an existing 0.02 file is
             refused; recreate it.
           - Reset the node recycle list in clear(): a stale free list handed the

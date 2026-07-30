@@ -87,6 +87,24 @@ new_from_fd(class, fd)
   OUTPUT:
     RETVAL
 
+SV *
+new_readonly(class, path)
+    const char *class
+    SV *path
+  PREINIT:
+    char errbuf[RDX_ERR_BUFLEN];
+  CODE:
+    /* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, lock-free.
+       Requires ->freeze on the producer; a non-frozen file is refused. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (!p) croak("Data::RadixTree::Shared->new_readonly: path is required");
+    RdxHandle *h = rdx_open_readonly(p, errbuf);
+    if (!h) croak("Data::RadixTree::Shared->new_readonly: %s", errbuf);
+    class = SvPV_nolen(ST(0));   /* re-read: SvGETMAGIC(path) above can run Perl that reallocs/frees ST(0)'s PV */
+    MAKE_OBJ(class, h);
+  OUTPUT:
+    RETVAL
+
 void
 DESTROY(self)
     SV *self
@@ -107,11 +125,13 @@ insert(self, key, value = 1)
     const char *kp;
     int isnew;
   CODE:
+    if (h->readonly) croak("Data::RadixTree::Shared->insert: tree is frozen (read-only)");
     /* Resolve key bytes BEFORE locking: SvPVbyte croaks on wide chars, and a
        croak must never happen while holding the lock. */
     kp = SvPVbyte(key, klen);
     REEXTRACT(self);
     rdx_rwlock_wrlock(h);
+    if (h->hdr->sealed) { rdx_rwlock_wrunlock(h); croak("Data::RadixTree::Shared->insert: tree is frozen (read-only)"); }
     if (!rdx_insert_has_room(h, (uint32_t)klen)) {
         rdx_rwlock_wrunlock(h);   /* release BEFORE croak */
         croak("Data::RadixTree::Shared->insert: capacity exhausted "
@@ -137,9 +157,13 @@ lookup(self, key)
   CODE:
     kp = SvPVbyte(key, klen);   /* before the lock */
     REEXTRACT(self);
-    rdx_rwlock_rdlock(h);
-    found = rdx_lookup_locked(h, (const uint8_t *)kp, (uint32_t)klen, &val);
-    rdx_rwlock_rdunlock(h);
+    if (h->readonly) {          /* frozen: immutable tree, no lock needed */
+        found = rdx_lookup_locked(h, (const uint8_t *)kp, (uint32_t)klen, &val);
+    } else {
+        rdx_rwlock_rdlock(h);
+        found = rdx_lookup_locked(h, (const uint8_t *)kp, (uint32_t)klen, &val);
+        rdx_rwlock_rdunlock(h);
+    }
     RETVAL = found ? newSVuv((UV)val) : &PL_sv_undef;
   OUTPUT:
     RETVAL
@@ -155,9 +179,13 @@ exists(self, key)
   CODE:
     kp = SvPVbyte(key, klen);   /* before the lock */
     REEXTRACT(self);
-    rdx_rwlock_rdlock(h);
-    RETVAL = rdx_lookup_locked(h, (const uint8_t *)kp, (uint32_t)klen, NULL) ? 1 : 0;
-    rdx_rwlock_rdunlock(h);
+    if (h->readonly) {          /* frozen: immutable tree, no lock needed */
+        RETVAL = rdx_lookup_locked(h, (const uint8_t *)kp, (uint32_t)klen, NULL) ? 1 : 0;
+    } else {
+        rdx_rwlock_rdlock(h);
+        RETVAL = rdx_lookup_locked(h, (const uint8_t *)kp, (uint32_t)klen, NULL) ? 1 : 0;
+        rdx_rwlock_rdunlock(h);
+    }
   OUTPUT:
     RETVAL
 
@@ -174,9 +202,13 @@ longest_prefix(self, key)
   CODE:
     kp = SvPVbyte(key, klen);   /* before the lock */
     REEXTRACT(self);
-    rdx_rwlock_rdlock(h);
-    found = rdx_longest_prefix_locked(h, (const uint8_t *)kp, (uint32_t)klen, &val);
-    rdx_rwlock_rdunlock(h);
+    if (h->readonly) {          /* frozen: immutable tree, no lock needed */
+        found = rdx_longest_prefix_locked(h, (const uint8_t *)kp, (uint32_t)klen, &val);
+    } else {
+        rdx_rwlock_rdlock(h);
+        found = rdx_longest_prefix_locked(h, (const uint8_t *)kp, (uint32_t)klen, &val);
+        rdx_rwlock_rdunlock(h);
+    }
     RETVAL = found ? newSVuv((UV)val) : &PL_sv_undef;
   OUTPUT:
     RETVAL
@@ -191,9 +223,11 @@ delete(self, key)
     const char *kp;
     int removed;
   CODE:
+    if (h->readonly) croak("Data::RadixTree::Shared->delete: tree is frozen (read-only)");
     kp = SvPVbyte(key, klen);   /* before the lock */
     REEXTRACT(self);
     rdx_rwlock_wrlock(h);
+    if (h->hdr->sealed) { rdx_rwlock_wrunlock(h); croak("Data::RadixTree::Shared->delete: tree is frozen (read-only)"); }
     removed = rdx_delete_locked(h, (const uint8_t *)kp, (uint32_t)klen);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     rdx_rwlock_wrunlock(h);
@@ -207,10 +241,42 @@ clear(self)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::RadixTree::Shared->clear: tree is frozen (read-only)");
     rdx_rwlock_wrlock(h);
+    if (h->hdr->sealed) { rdx_rwlock_wrunlock(h); croak("Data::RadixTree::Shared->clear: tree is frozen (read-only)"); }
     rdx_clear_locked(h);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     rdx_rwlock_wrunlock(h);
+
+void
+freeze(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    if (h->readonly) croak("Data::RadixTree::Shared->freeze: cannot freeze a read-only handle");
+    if (rdx_freeze(h) != 0) croak("Data::RadixTree::Shared->freeze: msync: %s", strerror(errno));
+    h->readonly = 1;   /* this handle now rejects mutation too (the file is sealed) */
+
+UV
+frozen(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->hdr->sealed ? 1 : 0;
+  OUTPUT:
+    RETVAL
+
+UV
+readonly(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->readonly ? 1 : 0;
+  OUTPUT:
+    RETVAL
 
 UV
 count(self)
@@ -218,9 +284,13 @@ count(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    rdx_rwlock_rdlock(h);
-    RETVAL = (UV)h->hdr->keys;
-    rdx_rwlock_rdunlock(h);
+    if (h->readonly) {          /* frozen: immutable tree, no lock needed */
+        RETVAL = (UV)h->hdr->keys;
+    } else {
+        rdx_rwlock_rdlock(h);
+        RETVAL = (UV)h->hdr->keys;
+        rdx_rwlock_rdunlock(h);
+    }
   OUTPUT:
     RETVAL
 
@@ -235,14 +305,14 @@ stats(self)
         uint32_t node_used, node_cap, arena_used, arena_cap;
         /* Snapshot under the lock; do all (croak-capable) Perl allocation after
            releasing it -- so an OOM in newHV/newSV* can never strand the lock. */
-        rdx_rwlock_rdlock(h);
+        if (!h->readonly) rdx_rwlock_rdlock(h);   /* frozen: immutable, no lock */
         keys       = h->hdr->keys;
         node_used  = h->hdr->node_used;
         node_cap   = h->hdr->node_cap;
         arena_used = h->hdr->arena_used;
         arena_cap  = h->hdr->arena_cap;
         ops        = h->hdr->stat_ops;
-        rdx_rwlock_rdunlock(h);
+        if (!h->readonly) rdx_rwlock_rdunlock(h);
 
         HV *hv = newHV();
         hv_stores(hv, "keys",           newSVuv((UV)keys));
@@ -252,6 +322,8 @@ stats(self)
         hv_stores(hv, "arena_capacity", newSVuv((UV)arena_cap));
         hv_stores(hv, "ops",            newSVuv((UV)ops));
         hv_stores(hv, "mmap_size",      newSVuv((UV)h->mmap_size));
+        hv_stores(hv, "frozen",         newSVuv(h->hdr->sealed ? 1 : 0));
+        hv_stores(hv, "readonly",       newSVuv(h->readonly ? 1 : 0));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:
@@ -283,7 +355,7 @@ sync(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    if (rdx_msync(h) != 0) croak("sync: %s", strerror(errno));
+    if (!h->readonly && rdx_msync(h) != 0) croak("sync: %s", strerror(errno));
 
 void
 unlink(self, ...)

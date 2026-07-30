@@ -51,6 +51,11 @@ Data::RadixTree::Shared - shared-memory compressed radix tree (prefix tree) for 
     # share across processes via a backing file
     my $shared = Data::RadixTree::Shared->new("/tmp/routes.bin", 1 << 16, 1 << 20);
 
+    # freeze and ship: query it read-only (lock-free) on other machines
+    $shared->freeze;
+    my $ro = Data::RadixTree::Shared->new_readonly("/tmp/routes.bin");
+    $ro->longest_prefix("10.0.0.5");
+
 =head1 DESCRIPTION
 
 A compressed radix tree (a radix-256, PATRICIA-style trie) in shared memory. It
@@ -99,6 +104,7 @@ set. B<Linux-only.> Requires 64-bit Perl.
     my $t = Data::RadixTree::Shared->new(undef, $node_capacity, $arena_capacity); # anonymous
     my $t = Data::RadixTree::Shared->new_memfd($name, $node_capacity, $arena_capacity);
     my $t = Data::RadixTree::Shared->new_from_fd($fd);
+    my $ro = Data::RadixTree::Shared->new_readonly($path);   # frozen file, read-only
 
 C<$path> is the backing file (C<undef> or omitted for an anonymous mapping).
 C<$node_capacity> (default 4096) is the number of tree nodes the pool holds; it
@@ -112,7 +118,8 @@ When reopening an existing file or memfd, the B<stored geometry wins> and the
 existing keys are preserved; the capacities you pass to C<new> on a reopen are
 only used when the file is brand new. C<new_memfd> creates a Linux memfd
 (transferable via its C<memfd> descriptor); C<new_from_fd> reopens one in
-another process.
+another process. C<new_readonly> opens a B<frozen> file read-only for
+lock-free querying (see L</"FROZEN (READ-ONLY) MODE">).
 
 C<$mode> (default C<0600>, owner-only) is the permission mode for a B<newly
 created> backing file; pass e.g. C<0660> to opt into cross-user sharing. The
@@ -210,6 +217,11 @@ on C<clear>).
 
 =item * C<mmap_size> -- bytes of the shared mapping.
 
+=item * C<frozen> -- 1 if the tree has been sealed by C<freeze> (immutable), else 0.
+
+=item * C<readonly> -- 1 if this handle is a read-only view (from C<new_readonly>,
+or the handle that called C<freeze>), else 0.
+
 =back
 
 =head1 SHARING ACROSS PROCESSES
@@ -228,6 +240,44 @@ so the final contents are independent of how the processes interleave.
     unless (fork) { $t->insert("child-$_", $_) for 1 .. 1000; exit }
     wait;
     print $t->count, "\n";   # reflects the child's inserts
+
+=head1 FROZEN (READ-ONLY) MODE
+
+A file-backed tree can be B<frozen> and then shipped to other machines, where
+consumers open it B<read-only> and query it with B<no locking at all>.
+
+    # producer: build, freeze, ship the file
+    my $t = Data::RadixTree::Shared->new("/tmp/routes.bin", 1 << 16, 1 << 20);
+    $t->insert($_, $routes{$_}) for keys %routes;
+    $t->freeze;                 # seal: now immutable, and $t itself is read-only
+    # ... copy /tmp/routes.bin to another host ...
+
+    # consumer (any process, same architecture): read-only, lock-free
+    my $ro = Data::RadixTree::Shared->new_readonly("/tmp/routes.bin");
+    $ro->longest_prefix($_) for @queries;
+
+C<freeze> takes the write lock, marks the tree B<permanently immutable> (there
+is no unfreeze -- rebuild the file to change it), and flushes the seal to disk.
+A frozen tree rejects every mutator (C<insert>, C<delete>, C<clear>) with a
+croak, and a read-write reopen (C<< new($path, ...) >>) of a sealed file is
+B<refused> -- so a shipped artifact can never be silently mutated out from
+under its readers.
+
+C<new_readonly($path)> maps the file C<O_RDONLY> / C<PROT_READ> and B<requires it
+to be frozen> (it croaks on a file that was never C<freeze>d). Because a sealed
+tree's nodes and label arena are immutable, C<lookup>, C<get>, C<exists>,
+C<contains>, C<longest_prefix>, C<count>/C<size> and C<stats> read them
+B<directly, taking no reader lock> -- the mapping is never written, so a
+read-only view works from a read-only file descriptor or a read-only
+filesystem, and any number of processes can share one C<PROT_READ> mapping.
+C<frozen> and C<readonly> report the two states.
+
+B<Portability.> The on-disk format is native binary (native-endian 32-bit node
+links), so a frozen file may be copied only between machines of the B<same
+architecture>; a wrong-endian file is rejected at open by the magic check.
+B<Copy the file to each consumer> -- do not share one file over a network
+filesystem: the lock is a Linux futex (process-local to one kernel), and the
+"no live writer" contract assumes a static copy. Linux-only; 64-bit Perl.
 
 =head1 SECURITY
 

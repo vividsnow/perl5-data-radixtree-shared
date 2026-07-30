@@ -122,7 +122,8 @@ struct RdxHeader {
     uint32_t drain_seq;               /* 80  futex bumped by a reader releasing under a draining writer (wakes it) */
     uint32_t slotless_rdepth;         /* readers holding with no reader-slot (documented residual) */
     uint64_t stat_ops;                /* 88 */
-    uint8_t  _pad[160];               /* 96..255 */
+    uint8_t  sealed;                  /* 96  0 = mutable, 1 = frozen (read-only; lock-free reads) */
+    uint8_t  _pad[159];               /* 97..255 */
 };
 typedef struct RdxHeader RdxHeader;
 
@@ -150,6 +151,7 @@ typedef struct RdxHandle {
     uint32_t       cached_pid;    /* getpid() cached at last slot claim */
     uint32_t       cached_fork_gen; /* rdx_fork_gen value at last slot claim */
     uint32_t slotless_held; /* read-locks this process holds with no reader-slot */
+    int      readonly;      /* 1 = frozen O_RDONLY/PROT_READ view: lock-free reads, mutation croaks */
 } RdxHandle;
 
 /* ================================================================
@@ -1052,6 +1054,10 @@ static RdxHandle *rdx_create(const char *path, uint64_t node_cap_in, uint64_t ar
             if (!rdx_validate_header((RdxHeader *)base, (uint64_t)st.st_size)) {
                 RDX_ERR("invalid radix-tree file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
+            if (((RdxHeader *)base)->sealed) {
+                RDX_ERR("%s is frozen (read-only); open it with new_readonly", path);
+                munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
+            }
             flock(fd, LOCK_UN); close(fd);
             return rdx_setup(base, map_size, path, -1);
         }
@@ -1090,6 +1096,10 @@ static RdxHandle *rdx_open_fd(int fd, char *errbuf) {
     if (!rdx_validate_header((RdxHeader *)base, (uint64_t)st.st_size)) {
         RDX_ERR("invalid radix-tree table"); munmap(base, ms); return NULL;
     }
+    if (((RdxHeader *)base)->sealed) {
+        RDX_ERR("this radix tree is frozen (read-only); open it with new_readonly");
+        munmap(base, ms); return NULL;
+    }
     int myfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (myfd < 0) { RDX_ERR("fcntl: %s", strerror(errno)); munmap(base, ms); return NULL; }
     return rdx_setup(base, ms, NULL, myfd);
@@ -1120,6 +1130,49 @@ static void rdx_destroy(RdxHandle *h) {
 static inline int rdx_msync(RdxHandle *h) {
     if (!h || !h->base) return 0;
     return msync(h->base, h->mmap_size, MS_SYNC);
+}
+
+/* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, no lock ever.
+ * The node pool and label arena are immutable in a sealed file, so lookup /
+ * exists / longest_prefix / count / stats read directly with no reader-slot /
+ * rwlock traffic -- the mapping is never written, so it works from a
+ * read-only fd / read-only filesystem and can be shared PROT_READ across
+ * processes (same architecture; the native magic rejects a wrong-endian file
+ * at validation). */
+static RdxHandle *rdx_open_readonly(const char *path, char *errbuf) {
+    if (errbuf) errbuf[0] = '\0';
+    int fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if (fd < 0) { RDX_ERR("open %s: %s", path, strerror(errno)); return NULL; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { RDX_ERR("fstat %s: %s", path, strerror(errno)); close(fd); return NULL; }
+    if ((uint64_t)st.st_size < sizeof(RdxHeader)) { RDX_ERR("%s: file too small", path); close(fd); return NULL; }
+    size_t ms = (size_t)st.st_size;
+    void *base = mmap(NULL, ms, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);   /* the mapping keeps the file; a read-only view needs no fd (no msync/ftruncate) */
+    if (base == MAP_FAILED) { RDX_ERR("mmap %s: %s", path, strerror(errno)); return NULL; }
+    if (!rdx_validate_header((RdxHeader *)base, (uint64_t)st.st_size)) {
+        RDX_ERR("%s: invalid radix-tree file", path); munmap(base, ms); return NULL;
+    }
+    if (!((RdxHeader *)base)->sealed) {
+        RDX_ERR("%s is not frozen: call ->freeze on the producer before opening read-only", path);
+        munmap(base, ms); return NULL;
+    }
+    RdxHandle *h = rdx_setup(base, ms, path, -1);   /* munmaps on OOM */
+    if (!h) { RDX_ERR("out of memory"); return NULL; }
+    h->readonly = 1;
+    return h;
+}
+
+/* Seal a tree: make it permanently immutable so it can be shipped and opened
+ * read-only.  Takes the write lock so no insert/delete is in flight,
+ * publishes the seal, then flushes it (file/memfd-backed).  Afterwards every
+ * mutator croaks and a read-write reopen is refused. */
+static int rdx_freeze(RdxHandle *h) {
+    rdx_rwlock_wrlock(h);
+    h->hdr->sealed = 1;
+    rdx_rwlock_wrunlock(h);
+    if (h->path || h->backing_fd >= 0) return rdx_msync(h);  /* durability for file/memfd-backed */
+    return 0;   /* anonymous: the seal lives in shared memory (visible to forks); nothing to flush */
 }
 
 #endif /* RADIX_H */
