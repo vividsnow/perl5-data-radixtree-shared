@@ -53,7 +53,7 @@ new(class, path = &PL_sv_undef, node_capacity = 4096, arena_capacity = 65536, ..
      * SvPV_nolen(path) returns, so the capture must stay last. */
     const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     RdxHandle *h = rdx_create(p, (uint64_t)node_capacity, (uint64_t)arena_capacity, mode, errbuf);   /* validates args into errbuf */
-    if (!h) croak("Data::RadixTree::Shared->new: %s", errbuf);
+    if (!h) croak("Data::RadixTree::Shared->new: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -69,7 +69,7 @@ new_memfd(class, name = &PL_sv_undef, node_capacity = 4096, arena_capacity = 655
   CODE:
     const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;   /* undef -> default label */
     RdxHandle *h = rdx_create_memfd(nm, (uint64_t)node_capacity, (uint64_t)arena_capacity, errbuf);   /* validates args into errbuf */
-    if (!h) croak("Data::RadixTree::Shared->new_memfd: %s", errbuf);
+    if (!h) croak("Data::RadixTree::Shared->new_memfd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -82,7 +82,7 @@ new_from_fd(class, fd)
     char errbuf[RDX_ERR_BUFLEN];
   CODE:
     RdxHandle *h = rdx_open_fd(fd, errbuf);
-    if (!h) croak("Data::RadixTree::Shared->new_from_fd: %s", errbuf);
+    if (!h) croak("Data::RadixTree::Shared->new_from_fd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
