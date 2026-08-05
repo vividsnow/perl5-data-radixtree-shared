@@ -1078,7 +1078,6 @@ static RdxHandle *rdx_create(const char *path, uint64_t node_cap_in, uint64_t ar
                         RDX_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                     }
-                    memset(base, 0, map_size);   /* start from a provably empty tree */
                     rdx_init_header(base, node_cap, arena_cap, total);
                     flock(fd, LOCK_UN); close(fd);
                     return rdx_setup(base, map_size, path, -1);
