@@ -937,9 +937,10 @@ static inline void rdx_init_header(void *base, uint32_t node_cap, uint32_t arena
         hdr->keys      = 0;
     }
     /* Publish magic LAST, as a release store: it is the commit point, so a
-       creator killed before this store leaves magic==0 -- which the
-       crashed-creator recovery treats as an abandoned mid-init file and
-       recovers, instead of a magic-set-but-incomplete header that would brick. */
+       creator killed before it leaves magic==0 and the file is never mistaken
+       for a valid one.  Recovery re-initializes such a file only while it is
+       still all-zero (a kill during the ftruncate or the zeroing above); a kill
+       during the few field stores leaves a file to remove by hand. */
     __atomic_store_n(&hdr->magic, RDX_MAGIC, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
@@ -1081,6 +1082,11 @@ static RdxHandle *rdx_create(const char *path, uint64_t node_cap_in, uint64_t ar
                     rdx_init_header(base, node_cap, arena_cap, total);
                     flock(fd, LOCK_UN); close(fd);
                     return rdx_setup(base, map_size, path, -1);
+                }
+                if (((RdxHeader *)base)->magic == 0 && (uint64_t)st.st_size == total
+                    && st.st_uid == geteuid()) {
+                    RDX_ERR("%s: incomplete radix-tree file left by an interrupted create; remove it and retry", path);
+                    munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                 }
                 RDX_ERR("invalid radix-tree file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
